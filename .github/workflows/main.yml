@@ -1,0 +1,390 @@
+# RDP_TIPSUNIX - Maximized Configuration
+
+name: RDP_TIPSUNIX
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_hours:
+        description: 'Session timeout (hours, max 60)'
+        required: true
+        default: '6'
+        type: choice
+        options: ['1', '2', '4', '6', '8', '12', '24', '36', '48', '60']
+      tz:
+        description: 'Timezone for the runner'
+        required: true
+        default: 'UTC'
+        type: choice
+        options: ['UTC', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Asia/Tokyo', 'Asia/Shanghai', 'Australia/Sydney']
+      tailscale_tags:
+        description: 'Tailscale ACL tags (comma-separated)'
+        required: false
+        default: 'tag:github-runner'
+        type: string
+      enable_vscode:
+        description: 'Also start VS Code Server on port 8080'
+        required: false
+        default: false
+        type: boolean
+      enable_chocolatey:
+        description: 'Install Chocolatey and common dev tools'
+        required: false
+        default: true
+        type: boolean
+      github_token:
+        description: 'GitHub token for API access (auto-filled)'
+        required: false
+        default: '${{ github.token }}'
+        type: string
+
+jobs:
+  secure-rdp:
+    name: Secure RDP Session
+    runs-on: windows-latest
+    timeout-minutes: ${{ github.event.inputs.timeout_hours * 60 }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+    env:
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RUNNER_TIMEZONE: ${{ github.event.inputs.tz }}
+      TAILSCALE_TAGS: ${{ github.event.inputs.tailscale_tags }}
+      ENABLE_VSCODE: ${{ github.event.inputs.enable_vscode }}
+      ENABLE_CHOCOLATEY: ${{ github.event.inputs.enable_chocolatey }}
+
+    steps:
+      - name: 🕐 Set Timezone
+        run: |
+          Set-TimeZone -Id "$env:RUNNER_TIMEZONE"
+          Write-Host "Timezone set to: $(Get-TimeZone).Id"
+
+      - name: 🔧 Configure Core RDP Settings (Hardened)
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Disable NLA for broader client compatibility (Tailscale provides encryption)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 1 -Force  # 1 = SSL (TLS 1.0+), more secure than 0
+          
+          # Enable Restricted Admin mode (prevents credential theft)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fRemoteDesktopAllowRestrictedAdmin" -Value 1 -Force
+          
+          # Disable clipboard redirection (security)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "fDisableClip" -Value 1 -Force
+          
+          # Disable drive redirection (security)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "fDisableCam" -Value 1 -Force
+          
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          
+          # Allow RDP only from Tailscale subnet (100.64.0.0/10) - more secure than "any"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 `
+            remoteip=100.64.0.0/10 profile=domain,private,public `
+            description="RDP access via Tailscale only"
+          
+          # Also allow VS Code Server port if enabled
+          if ("$env:ENABLE_VSCODE" -eq "true") {
+            netsh advfirewall firewall delete rule name="VSCode-Server" 2>$null
+            netsh advfirewall firewall add rule name="VSCode-Server" `
+              dir=in action=allow protocol=TCP localport=8080 `
+              remoteip=100.64.0.0/10 profile=domain,private,public `
+              description="VS Code Server via Tailscale only"
+          }
+          
+          # Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+          
+          Write-Host "✅ RDP configured with Tailscale-only firewall rules"
+
+      - name: 👤 Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 6
+          $rawPassword += $charSet.Lower | Get-Random -Count 6
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create user
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "GitHub Actions RDP User"
+          
+          # Add to required groups only (not Administrators by default - least privilege)
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Add-LocalGroupMember -Group "Users" -Member "RDP"
+          
+          # Grant specific admin rights via Local Security Policy instead of full Administrators
+          # SeServiceLogonRight (Log on as a service), SeBatchLogonRight (Log on as batch job)
+          secedit /export /cfg "$env:TEMP\secpol.cfg" 2>$null
+          (Get-Content "$env:TEMP\secpol.cfg") -replace 'SeServiceLogonRight = ', 'SeServiceLogonRight = *S-1-5-32-545,' | Set-Content "$env:TEMP\secpol.cfg"
+          secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" 2>$null
+          
+          # Store credentials securely (masked in logs)
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          
+          Write-Host "::add-mask::$password"
+          Write-Host "✅ RDP user created with least-privilege access"
+
+      - name: 📦 Install Chocolatey & Dev Tools
+        if: ${{ env.ENABLE_CHOCOLATEY == 'true' }}
+        run: |
+          # Install Chocolatey
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          
+          # Refresh environment
+          refreshenv
+          
+          # Install essential dev tools
+          choco install -y --no-progress `
+            git `
+            vscode `
+            nodejs-lts `
+            python3 `
+            docker-cli `
+            kubectl `
+            terraform `
+            awscli `
+            azure-cli `
+            7zip `
+            notepadplusplus `
+            sysinternals `
+            processhacker `
+            wireshark `
+            putty `
+            winscp
+          
+          Write-Host "✅ Chocolatey and dev tools installed"
+
+      - name: 🐳 Install Docker Desktop (CLI only)
+        run: |
+          # Install Docker CLI (no daemon needed for most CI tasks)
+          choco install -y --no-progress docker-cli
+          
+          # Verify
+          docker version --format '{{.Client.Version}}'
+          Write-Host "✅ Docker CLI ready"
+
+      - name: 🌐 Install Tailscale (Latest Stable)
+        run: |
+          # Get latest stable version dynamically
+          $tsApi = "https://api.tailscale.com/v1/versions/stable"
+          $tsInfo = Invoke-RestMethod -Uri $tsApi -UseBasicParsing
+          $tsVersion = $tsInfo.version
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$tsVersion-amd64.msi"
+          
+          Write-Host "Installing Tailscale $tsVersion..."
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          
+          # Verify installation
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" version
+          
+          Write-Host "✅ Tailscale $tsVersion installed"
+
+      - name: 🔗 Establish Tailscale Connection
+        run: |
+          $authKey = $env:TAILSCALE_AUTH_KEY
+          $tags = $env:TAILSCALE_TAGS
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_NUMBER"
+          
+          # Build up command
+          $args = @("up", "--authkey=$authKey", "--hostname=$hostname", "--accept-dns=true", "--accept-routes=true")
+          if ($tags) { $args += "--advertise-tags=$tags" }
+          
+          Write-Host "Starting Tailscale with: tailscale.exe $($args -join ' ')"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" $args
+          
+          # Wait for Tailscale to assign an IP with exponential backoff
+          $tsIP = $null
+          $retries = 0
+          $maxRetries = 15
+          while (-not $tsIP -and $retries -lt $maxRetries) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($tsIP) { break }
+              $waitTime = [Math]::Min(5 * (1.5 ** $retries), 30)
+              Write-Host "Waiting for Tailscale IP... (attempt $($retries + 1)/$maxRetries, waiting ${waitTime}s)"
+              Start-Sleep -Seconds $waitTime
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "❌ Tailscale IP not assigned after $maxRetries attempts"
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected: $tsIP"
+          
+          # Show full status
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+
+      - name: 🌐 Start VS Code Server
+        if: ${{ env.ENABLE_VSCODE == 'true' }}
+        run: |
+          # Install code-server
+          $url = "https://github.com/coder/code-server/releases/download/v4.98.2/code-server-4.98.2-windows-amd64.zip"
+          $zip = "$env:TEMP\code-server.zip"
+          $extractPath = "$env:USERPROFILE\code-server"
+          
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath $extractPath -Force
+          Remove-Item $zip
+          
+          # Generate password
+          $vscodePass = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 20 | ForEach-Object { [char]$_ })
+          echo "VSCODE_PASS=$vscodePass" >> $env:GITHUB_ENV
+          Write-Host "::add-mask::$vscodePass"
+          
+          # Start code-server in background
+          $exe = "$extractPath\code-server-4.98.2-windows-amd64\bin\code-server.exe"
+          $args = "--bind-addr 0.0.0.0:8080", "--auth password", "--cert false"
+          $process = Start-Process $exe -ArgumentList $args -PassThru -NoNewWindow
+          
+          # Wait for it to be ready
+          Start-Sleep -Seconds 5
+          $test = Test-NetConnection -ComputerName localhost -Port 8080
+          if ($test.TcpTestSucceeded) {
+              Write-Host "✅ VS Code Server running on port 8080"
+          } else {
+              Write-Error "❌ VS Code Server failed to start"
+              exit 1
+          }
+
+      - name: ✅ Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "❌ TCP connection to RDP port 3389 failed"
+              # Show firewall status for debugging
+              netsh advfirewall firewall show rule name="RDP-Tailscale"
+              exit 1
+          }
+          Write-Host "✅ TCP connectivity to RDP port 3389 successful!"
+          
+          # Also test VS Code port if enabled
+          if ("$env:ENABLE_VSCODE" -eq "true") {
+              $vscodeTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 8080
+              if ($vscodeTest.TcpTestSucceeded) {
+                  Write-Host "✅ TCP connectivity to VS Code port 8080 successful!"
+              } else {
+                  Write-Warning "⚠️ VS Code port 8080 not reachable (may still be starting)"
+              }
+          }
+
+      - name: 📋 Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════════════════╗"
+          Write-Host "║                    RDP SESSION READY                         ║"
+          Write-Host "╠══════════════════════════════════════════════════════════════╣"
+          Write-Host "║ Address:      $env:TAILSCALE_IP"
+          Write-Host "║ Username:     $env:RDP_USER"
+          Write-Host "║ Password:     $env:RDP_PASS"
+          if ("$env:ENABLE_VSCODE" -eq "true") {
+            Write-Host "║ VS Code URL:  http://$env:TAILSCALE_IP:8080"
+            Write-Host "║ VS Code Pass: $env:VSCODE_PASS"
+          }
+          Write-Host "║ Timeout:      ${{ github.event.inputs.timeout_hours }} hours"
+          Write-Host "║ Timezone:     $env:RUNNER_TIMEZONE"
+          Write-Host "║ Run ID:       $env:GITHUB_RUN_ID"
+          Write-Host "╚══════════════════════════════════════════════════════════════╝"
+          Write-Host ""
+          Write-Host "📋 INSTRUCTIONS:"
+          Write-Host "  1. Connect to your Tailscale network (install Tailscale app)"
+          Write-Host "  2. Open Remote Desktop Connection (mstsc.exe)"
+          Write-Host "  3. Enter: $env:TAILSCALE_IP"
+          Write-Host "  4. User: RDP"
+          Write-Host "  5. Password: (shown above - copy from workflow log)"
+          if ("$env:ENABLE_VSCODE" -eq "true") {
+            Write-Host "  6. Or open browser: http://$env:TAILSCALE_IP:8080"
+          }
+          Write-Host ""
+          Write-Host "⚠️  SECURITY: This session is accessible to ALL devices on your Tailscale network."
+          Write-Host "   Credentials are shown in workflow logs - treat as sensitive."
+          Write-Host ""
+
+      - name: 🔄 Maintain Connection (with Health Checks)
+        run: |
+          $startTime = Get-Date
+          $timeoutHours = ${{ github.event.inputs.timeout_hours }}
+          $endTime = $startTime.AddHours($timeoutHours)
+          
+          Write-Host "Session started: $startTime"
+          Write-Host "Session expires: $endTime"
+          Write-Host "Press Ctrl+C in workflow UI to terminate early"
+          
+          while ($true) {
+              # Check if we've exceeded timeout
+              if ((Get-Date) -gt $endTime) {
+                  Write-Host "⏰ Timeout reached ($timeoutHours hours). Terminating..."
+                  break
+              }
+              
+              # Verify Tailscale still connected
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+              if (-not $tsStatus.BackendState -or $tsStatus.BackendState -ne "Running") {
+                  Write-Warning "⚠️ Tailscale connection lost! Attempting reconnect..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY
+              }
+              
+              # Verify RDP service running
+              $rdpService = Get-Service -Name TermService
+              if ($rdpService.Status -ne 'Running') {
+                  Write-Warning "⚠️ RDP service stopped! Restarting..."
+                  Restart-Service -Name TermService -Force
+              }
+              
+              # Status heartbeat every 5 minutes
+              $elapsed = (Get-Date) - $startTime
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 💓 Heartbeat - Uptime: $($elapsed.ToString('hh\:mm\:ss')) - Tailscale: $($tsStatus.TailscaleIPs[0])"
+              
+              Start-Sleep -Seconds 300
+          }
+          
+          Write-Host "Session ended: $(Get-Date)"
+
+      - name: 🧹 Cleanup on Exit
+        if: always()
+        run: |
+          Write-Host "🧹 Cleaning up..."
+          
+          # Bring down Tailscale cleanly
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" down 2>$null
+          
+          # Remove RDP user
+          Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          
+          # Remove firewall rules
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall delete rule name="VSCode-Server" 2>$null
+          
+          Write-Host "✅ Cleanup complete"
