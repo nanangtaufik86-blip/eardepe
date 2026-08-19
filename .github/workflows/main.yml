@@ -67,7 +67,7 @@ jobs:
           
           echo "RDP_USER=RDP" >> $env:GITHUB_ENV
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
-          echo "::add-mask::$password"
+          #echo "::add-mask::$password"
           Write-Host "✅ RDP user created successfully"
 
       - name: 📦 Install Tools (Essential)
