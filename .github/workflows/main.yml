@@ -67,11 +67,10 @@ jobs:
           
           echo "RDP_USER=RDP" >> $env:GITHUB_ENV
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
-          #echo "::add-mask::$password"
           Write-Host "✅ RDP user created successfully"
 
       - name: 📦 Install Tools (Essential)
-        if: ${{ inputs.enable_chocolatey }}
+        if: ${{ github.event.inputs.enable_chocolatey == 'true' || github.event.inputs.enable_chocolatey == true }}
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
