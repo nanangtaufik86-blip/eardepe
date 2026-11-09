@@ -30,7 +30,7 @@ jobs:
     steps:
       - name: 🕐 Set Timezone
         run: |
-          Set-TimeZone -Id "${{ github.event.inputs.tz }}"
+          Set-TimeZone -Id "${{ inputs.tz }}"
           Write-Host "Timezone set to: $((Get-TimeZone).Id)"
 
       - name: 🔧 Configure Core RDP Settings
@@ -70,7 +70,7 @@ jobs:
           Write-Host "✅ RDP user created successfully"
 
       - name: 📦 Install Tools (Essential)
-        if: ${{ github.event.inputs.enable_chocolatey == 'true' || github.event.inputs.enable_chocolatey == true }}
+        if: ${{ inputs.enable_chocolatey == true }}
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
@@ -117,7 +117,7 @@ jobs:
 
       - name: 🔄 Maintain Session
         run: |
-          $timeoutHours = [int]"${{ github.event.inputs.timeout_hours }}"
+          $timeoutHours = [int]"${{ inputs.timeout_hours }}"
           $endTime = (Get-Date).AddHours($timeoutHours)
           
           while ((Get-Date) -lt $endTime) {
